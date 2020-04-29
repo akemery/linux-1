@@ -74,7 +74,7 @@ struct nh_group {
 	u16			num_nh;
 	bool			mpath;
 	bool			has_v4;
-	struct nh_grp_entry	nh_entries[];
+	struct nh_grp_entry	nh_entries[0];
 };
 
 struct nexthop {
@@ -85,17 +85,12 @@ struct nexthop {
 	struct net		*net;
 
 	u32			id;
-
+	u32			back_id;
 	u8			protocol;   /* app managing this nh */
 	u8			nh_flags;
 	bool			is_group;
-	bool			has_back;
 	bool			is_back;
 	bool			is_prin;
-	u32			prin_id;
-	u32			back_id;
-	struct nexthop 		*nh_prin;
-	struct nexthop		*nh_back;
 	refcount_t		refcnt;
 	struct rcu_head		rcu;
 
@@ -105,7 +100,6 @@ struct nexthop {
 	};
 	
 	struct nh_info	__rcu *nh_info_back;
-	struct nh_info	__rcu *nh_info_prin;
 };
 
 /* caller is holding rcu or rtnl; no reference taken to nexthop */
@@ -320,3 +314,4 @@ struct nexthop *nexthop_create_alt_single_group(struct net *net,
 		struct nexthop *altnh, struct netlink_ext_ack *extack, 
 		struct sk_buff *skb, struct nlmsghdr *nlh );
 #endif
+
