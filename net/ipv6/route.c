@@ -3692,11 +3692,98 @@ out:
 	return ERR_PTR(err);
 }
 
+static int add_alt_route(struct fib6_config *cfg){
+	struct fib6_table *table;
+	struct fib6_node *fn;
+	struct nexthop *altnh;
+	bool found = false;
+	int err = -1;
+
+	table = fib6_get_table(cfg->fc_nlinfo.nl_net, cfg->fc_table);
+	if (!table) {
+		return err;
+	}
+
+	if(!cfg->fc_nh_id)
+		return err;
+
+ 	altnh = nexthop_find_by_id(cfg->fc_nlinfo.nl_net , cfg->fc_nh_id);
+
+	if(!altnh)
+		return err;
+
+	rcu_read_lock();
+	fn = fib6_locate(&table->tb6_root,
+			 &cfg->fc_dst, cfg->fc_dst_len,
+			 &cfg->fc_src, cfg->fc_src_len,
+			 !(cfg->fc_flags & RTF_CACHE));
+
+	if(fn && fn->leaf && fn->leaf->nh){
+		struct nexthop *nh = fn->leaf->nh;
+		if(altnh->id == nh->id)
+			return err;
+		nh->is_prin = true;
+		nh->back_id = altnh->id;
+		rcu_assign_pointer(nh->nh_info_back, altnh->nh_info);
+		found = true;
+	}
+	rcu_read_unlock();
+	if(found)
+		return 0;
+	return err;
+}
+
+static int del_alt_route(struct fib6_config *cfg){
+	struct fib6_table *table;
+	struct fib6_node *fn;
+	struct nexthop *altnh;
+	bool found = false;
+
+	table = fib6_get_table(cfg->fc_nlinfo.nl_net, cfg->fc_table);
+	if (!table) {
+		return -1;
+	}
+
+	if(!cfg->fc_nh_id)
+		return -1;
+
+ 	altnh = nexthop_find_by_id(cfg->fc_nlinfo.nl_net , cfg->fc_nh_id);
+
+	if(!altnh)
+		return -1;
+
+	rcu_read_lock();
+	fn = fib6_locate(&table->tb6_root,
+			 &cfg->fc_dst, cfg->fc_dst_len,
+			 &cfg->fc_src, cfg->fc_src_len,
+			 !(cfg->fc_flags & RTF_CACHE));
+
+	if(fn && fn->leaf && fn->leaf->nh){
+		struct nexthop *nh = fn->leaf->nh;
+		if(nh->back_id != altnh->id)
+			return -1;
+		found = true;
+		nh->is_prin = false;
+		nh->back_id = 0;
+		rcu_assign_pointer(nh->nh_info_back, NULL);
+	}
+	rcu_read_unlock();
+	if(found)
+		return 0;
+	return -1;
+}
+
 int ip6_route_add(struct fib6_config *cfg, gfp_t gfp_flags,
 		  struct netlink_ext_ack *extack)
 {
 	struct fib6_info *rt;
 	int err;
+
+	if(cfg->fc_nlinfo.nlh && 
+		(cfg->fc_nlinfo.nlh->nlmsg_flags & NLM_F_ALTROUTE)){
+		err  = add_alt_route(cfg);
+		return err;
+	}
 
 	rt = ip6_route_info_create(cfg, gfp_flags, extack);
 	if (IS_ERR(rt))
@@ -3878,6 +3965,12 @@ static int ip6_route_del(struct fib6_config *cfg,
 	struct fib6_info *rt;
 	struct fib6_node *fn;
 	int err = -ESRCH;
+
+	if(cfg->fc_nlinfo.nlh && 
+		(cfg->fc_nlinfo.nlh->nlmsg_flags & NLM_F_ALTROUTE)){
+		err = del_alt_route(cfg);
+		return err;
+	}
 
 	table = fib6_get_table(cfg->fc_nlinfo.nl_net, cfg->fc_table);
 	if (!table) {
@@ -6494,3 +6587,4 @@ void ip6_route_cleanup(void)
 	dst_entries_destroy(&ip6_dst_blackhole_ops);
 	kmem_cache_destroy(ip6_dst_ops_template.kmem_cachep);
 }
+

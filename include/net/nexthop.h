@@ -84,11 +84,12 @@ struct nexthop {
 	struct net		*net;
 
 	u32			id;
-
+	u32			back_id;
 	u8			protocol;   /* app managing this nh */
 	u8			nh_flags;
 	bool			is_group;
-
+	bool			is_back;
+	bool			is_prin;
 	refcount_t		refcnt;
 	struct rcu_head		rcu;
 
@@ -96,6 +97,7 @@ struct nexthop {
 		struct nh_info	__rcu *nh_info;
 		struct nh_group __rcu *nh_grp;
 	};
+	struct nh_info	__rcu *nh_info_back;
 };
 
 /* caller is holding rcu or rtnl; no reference taken to nexthop */
@@ -305,3 +307,4 @@ int nexthop_for_each_fib6_nh(struct nexthop *nh,
 			     int (*cb)(struct fib6_nh *nh, void *arg),
 			     void *arg);
 #endif
+

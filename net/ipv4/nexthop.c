@@ -788,6 +788,26 @@ static void __remove_nexthop_fib(struct net *net, struct nexthop *nh)
 	}
 }
 
+static void switch_alt_nexthop_dev(struct net_device *dev)
+{
+	unsigned int hash = nh_dev_hashfn(dev->ifindex);
+	struct net *net = dev_net(dev);
+	struct hlist_head *head = &net->nexthop.devhash[hash];
+	struct hlist_node *n;
+	struct nh_info *nhi;
+
+	hlist_for_each_entry_safe(nhi, n, head, dev_hash) {
+		if (nhi->fib_nhc.nhc_dev != dev)
+			continue;
+		if(nhi->nh_parent->nh_info_back && nhi->nh_parent->is_prin){
+			rcu_assign_pointer(nhi->nh_parent->nh_info,
+ 				nhi->nh_parent->nh_info_back);
+			nhi->nh_parent->is_prin = false;
+			nhi->nh_parent->is_back = true;
+		}	
+	}
+}
+
 static void __remove_nexthop(struct net *net, struct nexthop *nh,
 			     struct nl_info *nlinfo)
 {
@@ -1061,7 +1081,9 @@ static void nexthop_flush_dev(struct net_device *dev)
 	hlist_for_each_entry_safe(nhi, n, head, dev_hash) {
 		if (nhi->fib_nhc.nhc_dev != dev)
 			continue;
-
+		/* already switch to the backup link do not remove nexthop*/
+		if(nhi->nh_parent->is_back)
+			continue;
 		remove_nexthop(net, nhi->nh_parent, NULL);
 	}
 }
@@ -1221,6 +1243,8 @@ static struct nexthop *nexthop_create(struct net *net, struct nh_config *cfg,
 
 	nh->nh_flags = cfg->nh_flags;
 	nh->net = net;
+	nh->is_back = false;
+	nh->is_prin = false;
 
 	nhi->nh_parent = nh;
 	nhi->family = cfg->nh_family;
@@ -1463,24 +1487,144 @@ out:
 	return err;
 }
 
+static struct nexthop *nexthop_nhi_create(struct net *net, struct nexthop *nh, 
+		struct nh_config *cfg, struct netlink_ext_ack *extack)
+{
+	struct nh_info *nhi;
+	int err = 0;
+
+	nhi = kzalloc(sizeof(*nhi), GFP_KERNEL);
+	if (!nhi) {
+		kfree(nh);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	nh->nh_flags = cfg->nh_flags;
+
+
+	nhi->nh_parent = nh;
+	nhi->family = cfg->nh_family;
+	nhi->fib_nhc.nhc_scope = RT_SCOPE_LINK;
+
+	if (cfg->nh_blackhole) {
+		nhi->reject_nh = 1;
+		cfg->nh_ifindex = net->loopback_dev->ifindex;
+	}
+
+	switch (cfg->nh_family) {
+	case AF_INET:
+		err = nh_create_ipv4(net, nh, nhi, cfg, extack);
+		break;
+	case AF_INET6:
+		err = nh_create_ipv6(net, nh, nhi, cfg, extack);
+		break;
+	}
+
+	if (err) {
+		kfree(nhi);
+		return ERR_PTR(err);
+	}
+
+	/* add the entry to the device based hash */
+	nexthop_devhash_add(net, nhi);
+	/* restore nhi for nh */
+	rcu_assign_pointer(nh->nh_info, nhi);
+	return nh;
+}
+
+static struct nexthop *nexthop_nhi_add(struct net *net, struct nexthop *nh, 
+			struct nh_config *cfg, struct netlink_ext_ack *extack)
+{
+	struct nexthop *nh_t, *nh_back = NULL;
+	int err;
+
+	if (cfg->nlflags & NLM_F_REPLACE && !cfg->nh_id) {
+		NL_SET_ERR_MSG(extack, "Replace requires nexthop id");
+		return ERR_PTR(-EINVAL);
+	}
+
+	if (!cfg->nh_id) {
+		cfg->nh_id = nh_find_unused_id(net);
+		if (!cfg->nh_id) {
+			NL_SET_ERR_MSG(extack, "No unused id");
+			return ERR_PTR(-EINVAL);
+		}
+	}
+
+
+	nh_t = nexthop_nhi_create(net, nh, cfg, extack);
+
+	if (IS_ERR(nh_t))
+		return nh_t;
+
+	refcount_inc(&nh->refcnt);
+	nh->id = cfg->nh_id;
+	nh->protocol = cfg->nh_protocol;
+	nh->net = net;
+
+	err = insert_nexthop(net, nh, cfg, extack);
+	if (err) {
+		__remove_nexthop(net, nh, NULL);
+		nexthop_put(nh);
+		nh = ERR_PTR(err);
+	}
+	nh_back = nexthop_find_by_id(net, nh->back_id);
+	if(!nh_back)
+		return nh_back;
+	rcu_assign_pointer(nh->nh_info_back, nh_back->nh_info);
+	nh->is_prin = true;
+	return nh_t;
+}
+
 /* rtnl */
 static int rtm_new_nexthop(struct sk_buff *skb, struct nlmsghdr *nlh,
 			   struct netlink_ext_ack *extack)
 {
 	struct net *net = sock_net(skb->sk);
 	struct nh_config cfg;
-	struct nexthop *nh;
+	struct nexthop *nh, *nh_back;
 	int err;
+	unsigned int hash;
+	struct hlist_head *head;
+	struct hlist_node *n;
+	struct nh_info *nhi, *nnhi;
+	struct net_device *dev;
+	bool found = false;
 
 	err = rtm_to_nh_config(net, skb, nlh, &cfg, extack);
+
+
 	if (!err) {
-		nh = nexthop_add(net, &cfg, extack);
+		dev = __dev_get_by_index(net, cfg.nh_ifindex);
+		/* Does nh already exist ?*/
+		if(dev){
+			hash = nh_dev_hashfn(dev->ifindex);
+			head = &net->nexthop.devhash[hash];
+
+			hlist_for_each_entry_safe(nhi, n, head, dev_hash) {
+				if (nhi->fib_nhc.nhc_dev != dev)
+					continue;
+				found = true;
+				nh_back = nhi->nh_parent;
+				/* remove nhi*/
+				hlist_del(&nhi->dev_hash);
+				kfree(nhi);
+			}
+		}
+		/* nh already exist just create a nhi for it*/
+		if(found && nh_back && nh_back->is_back){
+			nh = nexthop_nhi_add(net, nh_back, &cfg, extack);
+			fib_flush(net);
+		}
+		else
+			nh = nexthop_add(net, &cfg, extack);
 		if (IS_ERR(nh))
 			err = PTR_ERR(nh);
 	}
 
 	return err;
 }
+
 
 static int nh_valid_get_del_req(struct nlmsghdr *nlh, u32 *id,
 				struct netlink_ext_ack *extack)
@@ -1683,6 +1827,44 @@ static int nh_valid_dump_req(const struct nlmsghdr *nlh, int *dev_idx,
 
 	return 0;
 }
+/*rtnl*/
+static int rtm_alt_nexthop(struct sk_buff *skb, struct nlmsghdr *nlh,
+			   struct netlink_ext_ack *extack)
+{
+	struct net *net = sock_net(skb->sk);
+	struct nh_config cfg;
+	struct nexthop *nh;
+	unsigned int hash;
+	struct hlist_head *head;
+	struct hlist_node *n;
+	struct nh_info *nhi;
+	struct net_device *dev;
+	int err;
+
+	err = rtm_to_nh_config(net, skb, nlh, &cfg, extack);
+	
+
+	dev = __dev_get_by_index(net, cfg.nh_ifindex);
+
+	hash = nh_dev_hashfn(dev->ifindex);
+	head = &net->nexthop.devhash[hash];
+	
+	nh = nexthop_find_by_id(net, cfg.nh_id);
+	if(!nh)
+		goto out;
+
+	hlist_for_each_entry_safe(nhi, n, head, dev_hash) {
+		if (nhi->fib_nhc.nhc_dev != dev)
+			continue;
+		if(nhi->nh_parent->id == nh->id)
+			goto out;
+		nh->is_prin = true;
+		rcu_assign_pointer(nh->nh_info_back, nhi);
+	}
+	return err;
+out:
+	return(-EINVAL);
+}
 
 /* rtnl */
 static int rtm_dump_nexthop(struct sk_buff *skb, struct netlink_callback *cb)
@@ -1774,6 +1956,9 @@ static int nh_netdev_event(struct notifier_block *this,
 		nexthop_sync_mtu(dev, info_ext->ext.mtu);
 		rt_cache_flush(dev_net(dev));
 		break;
+	case NETDEV_GOING_DOWN:
+		switch_alt_nexthop_dev(dev);
+		break;
 	}
 	return NOTIFY_DONE;
 }
@@ -1817,13 +2002,16 @@ static int __init nexthop_init(void)
 	rtnl_register(PF_UNSPEC, RTM_DELNEXTHOP, rtm_del_nexthop, NULL, 0);
 	rtnl_register(PF_UNSPEC, RTM_GETNEXTHOP, rtm_get_nexthop,
 		      rtm_dump_nexthop, 0);
+	rtnl_register(PF_UNSPEC, RTM_ALTNEXTHOP, rtm_alt_nexthop, NULL, 0);
 
 	rtnl_register(PF_INET, RTM_NEWNEXTHOP, rtm_new_nexthop, NULL, 0);
 	rtnl_register(PF_INET, RTM_GETNEXTHOP, NULL, rtm_dump_nexthop, 0);
+	rtnl_register(PF_INET, RTM_ALTNEXTHOP, rtm_alt_nexthop, NULL, 0);
 
 	rtnl_register(PF_INET6, RTM_NEWNEXTHOP, rtm_new_nexthop, NULL, 0);
 	rtnl_register(PF_INET6, RTM_GETNEXTHOP, NULL, rtm_dump_nexthop, 0);
-
+	rtnl_register(PF_INET6, RTM_ALTNEXTHOP, rtm_alt_nexthop, NULL, 0);
 	return 0;
 }
 subsys_initcall(nexthop_init);
+
