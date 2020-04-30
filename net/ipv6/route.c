@@ -824,6 +824,9 @@ static void __find_rr_leaf(struct fib6_info *f6i_start,
 				res->fib6_flags = RTF_REJECT;
 				res->fib6_type = RTN_BLACKHOLE;
 				res->f6i = f6i;
+				/*if(f6i && f6i->nh && f6i->nh->nh_flags == RTNH_F_DUMMY)
+					res->nh = f6i->nh->is_prin ? nexthop_fib6_nh(f6i->nh->nh_prin):nexthop_fib6_nh(f6i->nh->nh_back);	
+				else*/
 				res->nh = nexthop_fib6_nh(f6i->nh);
 				return;
 			}
@@ -840,6 +843,9 @@ static void __find_rr_leaf(struct fib6_info *f6i_start,
 		}
 		if (matched) {
 			res->f6i = f6i;
+			/*if(f6i && f6i->nh && f6i->nh->nh_flags == RTNH_F_DUMMY)
+				res->nh = f6i->nh->is_prin ? nexthop_fib6_nh(f6i->nh->nh_prin):nexthop_fib6_nh(f6i->nh->nh_back);
+			else*/
 			res->nh = nh;
 			res->fib6_flags = f6i->fib6_flags;
 			res->fib6_type = f6i->fib6_type;
@@ -919,6 +925,7 @@ static void rt6_select(struct net *net, struct fib6_node *fn, int oif,
 out:
 	if (!res->f6i) {
 		res->f6i = net->ipv6.fib6_null_entry;
+
 		res->nh = res->f6i->fib6_nh;
 		res->fib6_flags = res->f6i->fib6_flags;
 		res->fib6_type = res->f6i->fib6_type;
@@ -1000,7 +1007,6 @@ int rt6_route_rcv(struct net_device *dev, u8 *opt, int len,
 			fib6_clean_expires(rt);
 		else
 			fib6_set_expires(rt, jiffies + HZ * lifetime);
-
 		fib6_info_release(rt);
 	}
 	return 0;
@@ -1062,6 +1068,8 @@ static unsigned short fib6_info_dst_flags(struct fib6_info *rt)
 		flags |= DST_NOCOUNT;
 	if (rt->dst_nopolicy)
 		flags |= DST_NOPOLICY;
+	if (rt->dst_host)
+		flags |= DST_HOST;
 
 	return flags;
 }
@@ -1309,6 +1317,7 @@ static int __ip6_ins_rt(struct fib6_info *rt, struct nl_info *info,
 	struct fib6_table *table;
 
 	table = rt->fib6_table;
+
 	spin_lock_bh(&table->tb6_lock);
 	err = fib6_add(&table->tb6_root, rt, info, extack);
 	spin_unlock_bh(&table->tb6_lock);
@@ -1347,6 +1356,7 @@ static struct rt6_info *ip6_rt_cache_alloc(const struct fib6_result *res,
 
 	ip6_rt_copy_init(rt, res);
 	rt->rt6i_flags |= RTF_CACHE;
+	rt->dst.flags |= DST_HOST;
 	rt->rt6i_dst.addr = *daddr;
 	rt->rt6i_dst.plen = 128;
 
@@ -3139,6 +3149,7 @@ struct dst_entry *icmp6_dst_alloc(struct net_device *dev,
 		goto out;
 	}
 
+	rt->dst.flags |= DST_HOST;
 	rt->dst.input = ip6_input;
 	rt->dst.output  = ip6_output;
 	rt->rt6i_gateway  = fl6->daddr;
@@ -3471,7 +3482,7 @@ int fib6_nh_init(struct net *net, struct fib6_nh *fib6_nh,
 	    !netif_carrier_ok(dev))
 		fib6_nh->fib_nh_flags |= RTNH_F_LINKDOWN;
 
-	err = fib_nh_common_init(net, &fib6_nh->nh_common, cfg->fc_encap,
+	err = fib_nh_common_init(&fib6_nh->nh_common, cfg->fc_encap,
 				 cfg->fc_encap_type, cfg, gfp_flags, extack);
 	if (err)
 		goto out;
@@ -3641,6 +3652,8 @@ static struct fib6_info *ip6_route_info_create(struct fib6_config *cfg,
 
 	ipv6_addr_prefix(&rt->fib6_dst.addr, &cfg->fc_dst, cfg->fc_dst_len);
 	rt->fib6_dst.plen = cfg->fc_dst_len;
+	if (rt->fib6_dst.plen == 128)
+		rt->dst_host = true;
 
 #ifdef CONFIG_IPV6_SUBTREES
 	ipv6_addr_prefix(&rt->fib6_src.addr, &cfg->fc_src, cfg->fc_src_len);
@@ -3692,21 +3705,108 @@ out:
 	return ERR_PTR(err);
 }
 
+static int add_alt_route(struct fib6_config *cfg){
+	struct fib6_table *table;
+	struct fib6_node *fn;
+	struct nexthop *altnh;
+	bool found = false;
+	int err = -1;
+
+	table = fib6_get_table(cfg->fc_nlinfo.nl_net, cfg->fc_table);
+	if (!table) {
+		return err;
+	}
+
+	if(!cfg->fc_nh_id)
+		return err;
+
+ 	altnh = nexthop_find_by_id(cfg->fc_nlinfo.nl_net , cfg->fc_nh_id);
+
+	if(!altnh)
+		return err;
+
+	rcu_read_lock();
+	fn = fib6_locate(&table->tb6_root,
+			 &cfg->fc_dst, cfg->fc_dst_len,
+			 &cfg->fc_src, cfg->fc_src_len,
+			 !(cfg->fc_flags & RTF_CACHE));
+
+	if(fn && fn->leaf && fn->leaf->nh){
+		struct nexthop *nh = fn->leaf->nh;
+		if(altnh->id == nh->id)
+			return err;
+		nh->is_prin = true;
+		nh->back_id = altnh->id;
+		rcu_assign_pointer(nh->nh_info_back, altnh->nh_info);
+		found = true;
+	}
+	rcu_read_unlock();
+	if(found)
+		return 0;
+	return err;
+}
+
+static int del_alt_route(struct fib6_config *cfg){
+	struct fib6_table *table;
+	struct fib6_node *fn;
+	struct nexthop *altnh;
+	bool found = false;
+
+	table = fib6_get_table(cfg->fc_nlinfo.nl_net, cfg->fc_table);
+	if (!table) {
+		return -1;
+	}
+
+	if(!cfg->fc_nh_id)
+		return -1;
+
+ 	altnh = nexthop_find_by_id(cfg->fc_nlinfo.nl_net , cfg->fc_nh_id);
+
+	if(!altnh)
+		return -1;
+
+	rcu_read_lock();
+	fn = fib6_locate(&table->tb6_root,
+			 &cfg->fc_dst, cfg->fc_dst_len,
+			 &cfg->fc_src, cfg->fc_src_len,
+			 !(cfg->fc_flags & RTF_CACHE));
+
+	if(fn && fn->leaf && fn->leaf->nh){
+		struct nexthop *nh = fn->leaf->nh;
+		if(nh->back_id != altnh->id)
+			return -1;
+		found = true;
+		nh->is_prin = false;
+		nh->back_id = 0;
+		rcu_assign_pointer(nh->nh_info_back, NULL);
+	}
+	rcu_read_unlock();
+	if(found)
+		return 0;
+	return -1;
+}
+
+
 int ip6_route_add(struct fib6_config *cfg, gfp_t gfp_flags,
 		  struct netlink_ext_ack *extack)
 {
 	struct fib6_info *rt;
-	int err;
-
+	int err = -1;
+	if(cfg->fc_nlinfo.nlh && 
+		(cfg->fc_nlinfo.nlh->nlmsg_flags & NLM_F_ALTROUTE)){
+		err  = add_alt_route(cfg);
+		return err;
+	}
 	rt = ip6_route_info_create(cfg, gfp_flags, extack);
 	if (IS_ERR(rt))
 		return PTR_ERR(rt);
-
+	
 	err = __ip6_ins_rt(rt, &cfg->fc_nlinfo, extack);
 	fib6_info_release(rt);
-
 	return err;
 }
+
+
 
 static int __ip6_del_rt(struct fib6_info *rt, struct nl_info *info)
 {
@@ -3878,6 +3978,12 @@ static int ip6_route_del(struct fib6_config *cfg,
 	struct fib6_info *rt;
 	struct fib6_node *fn;
 	int err = -ESRCH;
+
+	if(cfg->fc_nlinfo.nlh && 
+		(cfg->fc_nlinfo.nlh->nlmsg_flags & NLM_F_ALTROUTE)){
+		err = del_alt_route(cfg);
+		return err;
+	}
 
 	table = fib6_get_table(cfg->fc_nlinfo.nl_net, cfg->fc_table);
 	if (!table) {
@@ -4364,7 +4470,7 @@ static int ip6_pkt_drop(struct sk_buff *skb, u8 code, int ipstats_mib_noroutes)
 			IP6_INC_STATS(net, idev, IPSTATS_MIB_INADDRERRORS);
 			break;
 		}
-		fallthrough;
+		/* FALLTHROUGH */
 	case IPSTATS_MIB_OUTNOROUTES:
 		IP6_INC_STATS(net, idev, ipstats_mib_noroutes);
 		break;
@@ -5192,7 +5298,6 @@ static int ip6_route_multipath_add(struct fib6_config *cfg,
 		 */
 		cfg->fc_nlinfo.nlh->nlmsg_flags &= ~(NLM_F_EXCL |
 						     NLM_F_REPLACE);
-		cfg->fc_nlinfo.nlh->nlmsg_flags |= NLM_F_CREATE;
 		nhn++;
 	}
 
@@ -5260,6 +5365,7 @@ static int ip6_route_multipath_del(struct fib6_config *cfg,
 
 	remaining = cfg->fc_mp_len;
 	rtnh = (struct rtnexthop *)cfg->fc_mp;
+
 
 	/* Parse a Multipath Entry */
 	while (rtnh_ok(rtnh, remaining)) {
@@ -5329,6 +5435,8 @@ static int inet6_rtm_newroute(struct sk_buff *skb, struct nlmsghdr *nlh,
 	else
 		return ip6_route_add(&cfg, GFP_KERNEL, extack);
 }
+
+
 
 /* add the overhead of this fib6_nh to nexthop_len */
 static int rt6_nh_nlmsg_size(struct fib6_nh *nh, void *arg)
@@ -6317,7 +6425,7 @@ static void __net_exit ip6_route_net_exit(struct net *net)
 
 static int __net_init ip6_route_net_init_late(struct net *net)
 {
-#ifdef CONFIG_PROC_FS
+#ifdef CONFIG_PROC_FSalt
 	proc_create_net("ipv6_route", 0, net->proc_net, &ipv6_route_seq_ops,
 			sizeof(struct ipv6_route_iter));
 	proc_create_net_single("rt6_stats", 0444, net->proc_net,
@@ -6437,6 +6545,7 @@ int __init ip6_route_init(void)
 	if (ret < 0)
 		goto out_register_late_subsys;
 
+
 	ret = rtnl_register_module(THIS_MODULE, PF_INET6, RTM_DELROUTE,
 				   inet6_rtm_delroute, NULL, 0);
 	if (ret < 0)
@@ -6494,3 +6603,4 @@ void ip6_route_cleanup(void)
 	dst_entries_destroy(&ip6_dst_blackhole_ops);
 	kmem_cache_destroy(ip6_dst_ops_template.kmem_cachep);
 }
+
