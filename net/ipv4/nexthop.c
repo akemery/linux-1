@@ -1494,13 +1494,9 @@ static struct nexthop *nexthop_nhi_create(struct net *net, struct nexthop *nh,
 	int err = 0;
 
 	nhi = kzalloc(sizeof(*nhi), GFP_KERNEL);
-	if (!nhi) {
-		kfree(nh);
+	if (!nhi) 
 		return ERR_PTR(-ENOMEM);
-	}
-
 	nh->nh_flags = cfg->nh_flags;
-
 
 	nhi->nh_parent = nh;
 	nhi->family = cfg->nh_family;
@@ -1556,24 +1552,20 @@ static struct nexthop *nexthop_nhi_add(struct net *net, struct nexthop *nh,
 
 	if (IS_ERR(nh_t))
 		return nh_t;
+	
 
 	refcount_inc(&nh->refcnt);
 	nh->id = cfg->nh_id;
 	nh->protocol = cfg->nh_protocol;
 	nh->net = net;
 
-	err = insert_nexthop(net, nh, cfg, extack);
-	if (err) {
-		__remove_nexthop(net, nh, NULL);
-		nexthop_put(nh);
-		nh = ERR_PTR(err);
-	}
 	nh_back = nexthop_find_by_id(net, nh->back_id);
 	if(!nh_back)
 		return nh_back;
 	rcu_assign_pointer(nh->nh_info_back, nh_back->nh_info);
 	nh->is_prin = true;
-	return nh_t;
+	nh->is_back = false;
+	return nh;
 }
 
 /* rtnl */
@@ -1587,12 +1579,13 @@ static int rtm_new_nexthop(struct sk_buff *skb, struct nlmsghdr *nlh,
 	unsigned int hash;
 	struct hlist_head *head;
 	struct hlist_node *n;
-	struct nh_info *nhi, *nnhi;
+	struct nh_info *nhi;
 	struct net_device *dev;
 	bool found = false;
 
 	err = rtm_to_nh_config(net, skb, nlh, &cfg, extack);
 
+	nh_back = NULL;
 
 	if (!err) {
 		dev = __dev_get_by_index(net, cfg.nh_ifindex);
@@ -1600,7 +1593,6 @@ static int rtm_new_nexthop(struct sk_buff *skb, struct nlmsghdr *nlh,
 		if(dev){
 			hash = nh_dev_hashfn(dev->ifindex);
 			head = &net->nexthop.devhash[hash];
-
 			hlist_for_each_entry_safe(nhi, n, head, dev_hash) {
 				if (nhi->fib_nhc.nhc_dev != dev)
 					continue;
@@ -1612,12 +1604,11 @@ static int rtm_new_nexthop(struct sk_buff *skb, struct nlmsghdr *nlh,
 			}
 		}
 		/* nh already exist just create a nhi for it*/
-		if(found && nh_back && nh_back->is_back){
+		if(found && nh_back && nh_back->is_back)
 			nh = nexthop_nhi_add(net, nh_back, &cfg, extack);
-			fib_flush(net);
-		}
 		else
 			nh = nexthop_add(net, &cfg, extack);
+
 		if (IS_ERR(nh))
 			err = PTR_ERR(nh);
 	}
