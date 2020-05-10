@@ -186,9 +186,6 @@ static int nla_put_nh_group(struct sk_buff *skb, struct nh_group *nhg)
 	if (nhg->mpath)
 		group_type = NEXTHOP_GRP_TYPE_MPATH;
 
-	/*if(nhg->frr)
-		group_type = NEXTHOP_GRP_TYPE_FRR;*/
-
 	if (nla_put_u16(skb, NHA_GROUP_TYPE, group_type))
 		goto nla_put_failure;
 
@@ -870,7 +867,6 @@ static void switch_alt_nexthop_dev(struct net_device *dev)
 
 	hlist_for_each_entry_safe(nhi, n, head, dev_hash) {
 
-		printk(KERN_INFO "looping??? (%d)\n", nhi->nh_parent->id);
 		if (nhi->fib_nhc.nhc_dev != dev)
 			continue;
 		if(nhi->nh_parent->is_frr){
@@ -1166,13 +1162,11 @@ static void nexthop_flush_dev(struct net_device *dev)
 	struct nh_info *nhi;
 
 	hlist_for_each_entry_safe(nhi, n, head, dev_hash) {
-		printk(KERN_INFO "looping II??? (%d)\n", nhi->nh_parent->id);
 		if (nhi->fib_nhc.nhc_dev != dev)
 			continue;
 		/* already switch to the backup link do not remove nexthop*/
 		if(nhi->nh_parent->is_frr){
 			struct nexthop *nh;
-			printk(KERN_INFO  "removing backup");
 			if(nhi->nh_parent->is_prin)
 				continue;
 			
@@ -2233,7 +2227,6 @@ static int nh_netdev_event(struct notifier_block *this,
 		switch_alt_nexthop_dev(dev);
 		break;
 	}
-	printk(KERN_INFO "event %ld\n", event);
 	return NOTIFY_DONE;
 }
 
