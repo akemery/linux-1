@@ -65,10 +65,12 @@ struct nlmsghdr {
 #define NLM_F_DUMP	(NLM_F_ROOT|NLM_F_MATCH)
 
 /* Modifiers to NEW request */
-#define NLM_F_REPLACE	0x100	/* Override existing		*/
-#define NLM_F_EXCL	0x200	/* Do not touch, if it exists	*/
-#define NLM_F_CREATE	0x400	/* Create, if it does not exist	*/
-#define NLM_F_APPEND	0x800	/* Add to end of list		*/
+#define NLM_F_REPLACE	  0x100	/* Override existing		*/
+#define NLM_F_EXCL	  0x200	/* Do not touch, if it exists	*/
+#define NLM_F_CREATE	  0x400	/* Create, if it does not exist	*/
+#define NLM_F_APPEND	  0x800	/* Add to end of list		*/
+#define NLM_F_ALTROUTE   0x1000	/* Add alternate route		*/
+#define NLM_F_LFANEXTHOP 0x2000 /* Add LFA NEXTHOP 	*/
 
 /* Modifiers to DELETE request */
 #define NLM_F_NONREC	0x100	/* Do not delete recursively	*/
@@ -250,3 +252,4 @@ struct nla_bitfield32 {
 };
 
 #endif /* _UAPI__LINUX_NETLINK_H */
+
