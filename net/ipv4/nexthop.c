@@ -186,6 +186,9 @@ static int nla_put_nh_group(struct sk_buff *skb, struct nh_group *nhg)
 	if (nhg->mpath)
 		group_type = NEXTHOP_GRP_TYPE_MPATH;
 
+	if (nhg->frr)
+		group_type = NEXTHOP_GRP_TYPE_FRR;
+
 	if (nla_put_u16(skb, NHA_GROUP_TYPE, group_type))
 		goto nla_put_failure;
 
@@ -435,7 +438,7 @@ static int nh_check_attr_group(struct net *net, struct nlattr *tb[],
 		if (!valid_group_nh(nh, len, extack))
 			return -EINVAL;
 	}
-	for (i = NHA_GROUP + 1; i < __NHA_MAX; ++i) {
+	for (i = NHA_GROUP_TYPE + 1; i < __NHA_MAX; ++i) {
 		if (!tb[i])
 			continue;
 
@@ -1192,93 +1195,6 @@ static void flush_all_nexthops(struct net *net)
 	}
 }
 
-static struct nexthop *nexthop_create_lfa(struct net *net,
-					    struct nh_config *cfg)
-{
-	struct nlattr *grps_attr = cfg->nh_grp;
-	struct nexthop_grp *entry = nla_data(grps_attr);
-	struct nh_group *nhg;
-	struct nexthop *nh;
-	struct nexthop *nhp, *nhb;
-	struct nh_info *nhi;
-	int num_nh = nla_len(grps_attr) / sizeof(*entry);
-
-	if(num_nh!=2)
-		return ERR_PTR(-ENOENT);
-
-	nh = nexthop_alloc();
-	if (!nh)
-		return ERR_PTR(-ENOMEM);
-
-	nh->is_group = 1;
-
-	nhg = nexthop_grp_alloc(2);
-	if (!nhg) {
-		kfree(nh);
-		return ERR_PTR(-ENOMEM);
-	}
-	if(entry[0].weight > entry[1].weight){
-		kfree(nhg);
-		kfree(nh);
-		return ERR_PTR(-ENOENT);
-	}
-
-	nhp = nexthop_find_by_id(net, entry[0].id);
-	if (!nexthop_get(nhp))
-		goto out_no_nh;
-
-	nhi = rtnl_dereference(nhp->nh_info);
-	if (nhi->family == AF_INET)
-			nhg->has_v4 = true;
-
-	nhb = nexthop_find_by_id(net, entry[1].id);
-	if (!nexthop_get(nhb))
-		goto out_no_nh;
-
-	nhi = rtnl_dereference(nhb->nh_info);
-	if (nhi->family == AF_INET)
-			nhg->has_v4 = true;
-
-	nhp->is_frr = true;
-	nhb->is_frr = true;
-
-	nhp->frr_state = true;
-	nhb->frr_state = true;
-
-	nhb->prin_id = nhp->id;
-	nhp->is_prin = true;
-
-	nhg->nh_entries[0].nh = nhp;
-	nhg->nh_entries[0].weight = entry[0].weight + 1;
-	list_add(&nhg->nh_entries[0].nh_list, &nhp->grp_list);
-	nhg->nh_entries[0].nh_parent = nh;
-
-	nhg->nh_entries[1].nh = nhb;
-	nhg->nh_entries[1].weight = entry[1].weight + 1;
-	list_add(&nhg->nh_entries[1].nh_list, &nhb->grp_list);
-	nhg->nh_entries[1].nh_parent = nh;
-	
-
-	nhg->frr = true;
-
-	if (cfg->nh_grp_type == NEXTHOP_GRP_TYPE_MPATH) {
-		nhg->mpath = true;
-		nh_group_rebalance(nhg);
-	}
-
-	rcu_assign_pointer(nh->nh_grp, nhg);
-
-	return nh;
-
-out_no_nh:
-	for (; i >= 0; --i)
-		nexthop_put(nhg->nh_entries[i].nh);
-
-	kfree(nhg);
-	kfree(nh);
-
-	return ERR_PTR(-ENOENT);
-}
  
 static struct nexthop *nexthop_create_group(struct net *net,
 					    struct nh_config *cfg)
@@ -1287,7 +1203,9 @@ static struct nexthop *nexthop_create_group(struct net *net,
 	struct nexthop_grp *entry = nla_data(grps_attr);
 	struct nh_group *nhg;
 	struct nexthop *nh;
-	int i;
+	int i = 0;
+
+
 
 	nh = nexthop_alloc();
 	if (!nh)
@@ -1295,11 +1213,17 @@ static struct nexthop *nexthop_create_group(struct net *net,
 
 	nh->is_group = 1;
 
+	
+
 	nhg = nexthop_grp_alloc(nla_len(grps_attr) / sizeof(*entry));
 	if (!nhg) {
 		kfree(nh);
 		return ERR_PTR(-ENOMEM);
 	}
+
+	if ((cfg->nh_grp_type == NEXTHOP_GRP_TYPE_FRR) &&
+		((nhg->num_nh != 2) || (entry[0].weight > entry[1].weight)))
+		goto out_no_nh;
 
 	for (i = 0; i < nhg->num_nh; ++i) {
 		struct nexthop *nhe;
@@ -1309,6 +1233,11 @@ static struct nexthop *nexthop_create_group(struct net *net,
 		if (!nexthop_get(nhe))
 			goto out_no_nh;
 
+		if (cfg->nh_grp_type == NEXTHOP_GRP_TYPE_FRR){
+			nhe->is_frr = true;
+			nhe->frr_state = true;	
+		}
+
 		nhi = rtnl_dereference(nhe->nh_info);
 		if (nhi->family == AF_INET)
 			nhg->has_v4 = true;
@@ -1317,10 +1246,20 @@ static struct nexthop *nexthop_create_group(struct net *net,
 		nhg->nh_entries[i].weight = entry[i].weight + 1;
 		list_add(&nhg->nh_entries[i].nh_list, &nhe->grp_list);
 		nhg->nh_entries[i].nh_parent = nh;
+		
+		
 	}
 
 	if (cfg->nh_grp_type == NEXTHOP_GRP_TYPE_MPATH) {
 		nhg->mpath = 1;
+		nh_group_rebalance(nhg);
+	}
+
+	if (cfg->nh_grp_type == NEXTHOP_GRP_TYPE_FRR) {
+		nhg->nh_entries[1].nh->prin_id = nhg->nh_entries[0].nh->id;
+		nhg->nh_entries[0].nh->is_prin =  true;
+		nhg->frr = true;
+		nhg->mpath = true;
 		nh_group_rebalance(nhg);
 	}
 
@@ -1421,7 +1360,6 @@ static struct nexthop *nexthop_create(struct net *net, struct nh_config *cfg,
 
 	nh->nh_flags = cfg->nh_flags;
 	nh->net = net;
-	nh->is_back = false;
 	nh->is_prin = false;
 
 	nhi->nh_parent = nh;
@@ -1452,89 +1390,6 @@ static struct nexthop *nexthop_create(struct net *net, struct nh_config *cfg,
 	nexthop_devhash_add(net, nhi);
 
 	rcu_assign_pointer(nh->nh_info, nhi);
-
-	return nh;
-}
-
-/* called with rtnl lock held */
-static struct nexthop *nexthop_add(struct net *net, struct nh_config *cfg,
-				   struct netlink_ext_ack *extack)
-{
-	struct nexthop *nh;
-	int err;
-
-	if (cfg->nlflags & NLM_F_REPLACE && !cfg->nh_id) {
-		NL_SET_ERR_MSG(extack, "Replace requires nexthop id");
-		return ERR_PTR(-EINVAL);
-	}
-
-	if (!cfg->nh_id) {
-		cfg->nh_id = nh_find_unused_id(net);
-		if (!cfg->nh_id) {
-			NL_SET_ERR_MSG(extack, "No unused id");
-			return ERR_PTR(-EINVAL);
-		}
-	}
-
-	if (cfg->nh_grp)
-		nh = nexthop_create_group(net, cfg);
-	else
-		nh = nexthop_create(net, cfg, extack);
-
-	if (IS_ERR(nh))
-		return nh;
-
-	refcount_set(&nh->refcnt, 1);
-	nh->id = cfg->nh_id;
-	nh->protocol = cfg->nh_protocol;
-	nh->net = net;
-
-	err = insert_nexthop(net, nh, cfg, extack);
-	if (err) {
-		__remove_nexthop(net, nh, NULL);
-		nexthop_put(nh);
-		nh = ERR_PTR(err);
-	}
-
-	return nh;
-}
-
-
-/* called with rtnl lock held */
-static struct nexthop *nexthop_add_lfa(struct net *net, struct nh_config *cfg,
-				   struct netlink_ext_ack *extack)
-{
-	struct nexthop *nh;
-	int err;
-
-	
-	if (!cfg->nh_id) {
-		NL_SET_ERR_MSG(extack, "No unused id");
-		return ERR_PTR(-EINVAL);
-	}
-
-	if (!cfg->nh_grp){
-		NL_SET_ERR_MSG(extack, "Should be a group");
-		return ERR_PTR(-EINVAL);
-	}
-	
-	nh = nexthop_create_lfa(net, cfg);
-
-	if (IS_ERR(nh))
-		return nh;
-
-	refcount_set(&nh->refcnt, 1);
-	nh->id = cfg->nh_id;
-	nh->protocol = cfg->nh_protocol;
-	nh->net = net;
-
-
-	err = insert_nexthop(net, nh, cfg, extack);
-	if (err) {
-		__remove_nexthop(net, nh, NULL);
-		nexthop_put(nh);
-		nh = ERR_PTR(err);
-	}
 
 	return nh;
 }
@@ -1604,6 +1459,7 @@ static int rtm_to_nh_config(struct net *net, struct sk_buff *skb,
 		cfg->nh_grp_type = NEXTHOP_GRP_TYPE_MPATH;
 		if (tb[NHA_GROUP_TYPE])
 			cfg->nh_grp_type = nla_get_u16(tb[NHA_GROUP_TYPE]);
+		
 
 		if (cfg->nh_grp_type > NEXTHOP_GRP_TYPE_MAX) {
 			NL_SET_ERR_MSG(extack, "Invalid group type");
@@ -1714,20 +1570,10 @@ static int rtm_new_nexthop(struct sk_buff *skb, struct nlmsghdr *nlh,
 	struct nh_config cfg;
 	struct nexthop *nh, *nh_back;
 	int err;
-	unsigned int hash;
-	struct hlist_head *head;
-	struct hlist_node *n;
 
 	err = rtm_to_nh_config(net, skb, nlh, &cfg, extack);
 
 	if (!err) {
-
-		if(cfg.nlflags & NLM_F_LFANEXTHOP){
-			nh  = nexthop_add_lfa(net, &cfg, extack);
-			if (IS_ERR(nh))
-				err = PTR_ERR(nh);
-			return err;
-		}
 		nh = nexthop_add(net, &cfg, extack);
 		if (IS_ERR(nh))
 			err = PTR_ERR(nh);
@@ -2174,4 +2020,3 @@ static int __init nexthop_init(void)
 	return 0;
 }
 subsys_initcall(nexthop_init);
-
