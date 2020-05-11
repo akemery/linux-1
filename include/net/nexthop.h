@@ -73,6 +73,7 @@ struct nh_group {
 	u16			num_nh;
 	bool			mpath;
 	bool			has_v4;
+	bool			frr;
 	struct nh_grp_entry	nh_entries[];
 };
 
@@ -84,11 +85,11 @@ struct nexthop {
 	struct net		*net;
 
 	u32			id;
-
 	u8			protocol;   /* app managing this nh */
 	u8			nh_flags;
 	bool			is_group;
-
+	bool			is_frr;
+	bool			frr_state;
 	refcount_t		refcnt;
 	struct rcu_head		rcu;
 
@@ -305,3 +306,4 @@ int nexthop_for_each_fib6_nh(struct nexthop *nh,
 			     int (*cb)(struct fib6_nh *nh, void *arg),
 			     void *arg);
 #endif
+
