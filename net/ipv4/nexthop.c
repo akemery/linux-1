@@ -494,12 +494,45 @@ struct nexthop *nexthop_select_path(struct nexthop *nh, int hash)
 
 	nhg = rcu_dereference(nh->nh_grp);
 	if(nhg->frr){ 
-		struct nexthop *p, *b, *n;
-		p = nhg->nh_entries[0].nh;
-		b = nhg->nh_entries[1].nh;
-		n = (p->frr_state) ? p : b;
-		return n;
-		
+		struct nexthop *p, *b;
+		struct nh_info *nhi;
+		switch(nhg->num_nh){
+			case 0:
+				return rc;
+			case 1:
+				b = nhg->nh_entries[0].nh;
+				if(!b)
+					return rc;
+				nhi = rcu_dereference(b->nh_info);
+				if (ipv6_good_nh(&nhi->fib6_nh) && (b->frr_state))
+					return b;
+				else return rc;
+			case 2:
+				p = nhg->nh_entries[0].nh;
+				b = nhg->nh_entries[1].nh;
+				if(!p){
+					if(!b)
+						return rc;
+				nhi = rcu_dereference(b->nh_info);
+				if (ipv6_good_nh(&nhi->fib6_nh) && (b->frr_state) )
+					return b;
+				else return rc;	
+				}
+				nhi = rcu_dereference(p->nh_info);
+				if (ipv6_good_nh(&nhi->fib6_nh) && (p->frr_state))
+					return p;
+				else{ 
+					if(!b)
+						return rc;
+					nhi = rcu_dereference(b->nh_info);
+					if (ipv6_good_nh(&nhi->fib6_nh) 
+							&& (b->frr_state))
+						return b;
+					else return rc;
+				}
+			default:
+				return rc;
+		}	
 	}
 
 	else{
@@ -548,11 +581,48 @@ int nexthop_for_each_fib6_nh(struct nexthop *nh,
 
 		nhg = rcu_dereference_rtnl(nh->nh_grp);
 		if(nhg->frr){
-			
 			struct nexthop *p, *b, *n;
-			p = nhg->nh_entries[0].nh;
-			b = nhg->nh_entries[1].nh;
-			n = (p->frr_state) ? p : b;
+			struct nh_info *nhi;
+			switch(nhg->num_nh){
+				case 0:
+					return -EINVAL;
+				case 1:
+					b = nhg->nh_entries[0].nh;
+					if(!b)
+						return -EINVAL;
+					nhi = rcu_dereference(b->nh_info);
+					if (ipv6_good_nh(&nhi->fib6_nh) && 
+								(b->frr_state))
+						n = b;
+					else return -EINVAL;
+				case 2:
+					p = nhg->nh_entries[0].nh;
+					b = nhg->nh_entries[1].nh;
+					if(!p){
+						if(!b)
+							return -EINVAL;
+					nhi = rcu_dereference(b->nh_info);
+					if (ipv6_good_nh(&nhi->fib6_nh) && 
+								(b->frr_state) )
+						n = b;
+					else return -EINVAL;	
+					}
+					nhi = rcu_dereference(p->nh_info);
+					if (ipv6_good_nh(&nhi->fib6_nh) && 
+								(p->frr_state))
+						n = p;
+					else{ 
+						if(!b)
+							return -EINVAL;
+						nhi = rcu_dereference(b->nh_info);
+						if (ipv6_good_nh(&nhi->fib6_nh) 
+							&& (b->frr_state))
+							n = b;
+						else return -EINVAL;
+					}
+				default:
+					return -EINVAL;
+			}
 			nhi = rcu_dereference_rtnl(n->nh_info);
 			err = cb(&nhi->fib6_nh, arg);
 			if (err)
