@@ -183,18 +183,17 @@ static int nla_put_nh_group(struct sk_buff *skb, struct nh_group *nhg)
 	u16 group_type = 0;
 	int i;
 
-	if (nhg->mpath)
-		group_type = NEXTHOP_GRP_TYPE_MPATH;
-
-	if (nhg->frr)
-		group_type = NEXTHOP_GRP_TYPE_FRR;
-
-	if (nla_put_u16(skb, NHA_GROUP_TYPE, group_type))
-		goto nla_put_failure;
-
-	nla = nla_reserve(skb, NHA_GROUP, len);
-	if (!nla)
-		goto nla_put_failure;
+	if (nhg->mpath){
+		if(nhg->frr)
+			group_type = NEXTHOP_GRP_TYPE_FRR;
+		else
+			group_type = NEXTHOP_GRP_TYPE_MPATH;
+		if (nla_put_u16(skb, NHA_GROUP_TYPE, group_type))
+			goto nla_put_failure;
+		nla = nla_reserve(skb, NHA_GROUP, len);
+		if (!nla)
+			goto nla_put_failure;
+	}
 
 	p = nla_data(nla);
 	for (i = 0; i < nhg->num_nh; ++i) {
@@ -371,6 +370,11 @@ static bool valid_group_nh(struct nexthop *nh, unsigned int npaths,
 	if (nh->is_group) {
 		struct nh_group *nhg = rtnl_dereference(nh->nh_grp);
 
+		/* nested multipath group is supported for FRR nexthop group*/
+
+		if(nhg->frr)
+			return true;
+
 		/* nested multipath (group within a group) is not
 		 * supported
 		 */
@@ -483,6 +487,48 @@ static bool ipv4_good_nh(const struct fib_nh *nh)
 	return !!(state & NUD_VALID);
 }
 
+static struct nexthop *get_active_back_nexthop(struct nh_group *nhg){
+	struct nexthop *p, *b;
+	struct nh_info *nhi;
+	switch(nhg->num_nh){
+		case 0:
+			return NULL;
+		case 1:
+			b = nhg->nh_entries[0].nh;
+			if(!b)
+				return NULL;
+			nhi = rcu_dereference(b->nh_info);
+			if (ipv6_good_nh(&nhi->fib6_nh) && (b->frr_state))
+				return b;
+			else return NULL;
+		case 2:
+			p = nhg->nh_entries[0].nh;
+			b = nhg->nh_entries[1].nh;
+			if(!p){
+				if(!b)
+					return NULL;
+				nhi = rcu_dereference(b->nh_info);
+				if (ipv6_good_nh(&nhi->fib6_nh) && (b->frr_state) )
+					return b;
+				else return NULL;	
+			}
+			nhi = rcu_dereference(p->nh_info);
+			if (ipv6_good_nh(&nhi->fib6_nh) && (p->frr_state))
+				return p;
+			else{ 
+				if(!b)
+					return NULL;
+				nhi = rcu_dereference(b->nh_info);
+				if (ipv6_good_nh(&nhi->fib6_nh) 
+						&& (b->frr_state))
+					return b;
+				else return NULL;
+				}
+		default:
+			return NULL;
+	}	
+}
+
 struct nexthop *nexthop_select_path(struct nexthop *nh, int hash)
 {
 	struct nexthop *rc = NULL;
@@ -494,45 +540,8 @@ struct nexthop *nexthop_select_path(struct nexthop *nh, int hash)
 
 	nhg = rcu_dereference(nh->nh_grp);
 	if(nhg->frr){ 
-		struct nexthop *p, *b;
-		struct nh_info *nhi;
-		switch(nhg->num_nh){
-			case 0:
-				return rc;
-			case 1:
-				b = nhg->nh_entries[0].nh;
-				if(!b)
-					return rc;
-				nhi = rcu_dereference(b->nh_info);
-				if (ipv6_good_nh(&nhi->fib6_nh) && (b->frr_state))
-					return b;
-				else return rc;
-			case 2:
-				p = nhg->nh_entries[0].nh;
-				b = nhg->nh_entries[1].nh;
-				if(!p){
-					if(!b)
-						return rc;
-				nhi = rcu_dereference(b->nh_info);
-				if (ipv6_good_nh(&nhi->fib6_nh) && (b->frr_state) )
-					return b;
-				else return rc;	
-				}
-				nhi = rcu_dereference(p->nh_info);
-				if (ipv6_good_nh(&nhi->fib6_nh) && (p->frr_state))
-					return p;
-				else{ 
-					if(!b)
-						return rc;
-					nhi = rcu_dereference(b->nh_info);
-					if (ipv6_good_nh(&nhi->fib6_nh) 
-							&& (b->frr_state))
-						return b;
-					else return rc;
-				}
-			default:
-				return rc;
-		}	
+		rc = get_active_back_nexthop(nhg);
+		return rc;
 	}
 
 	else{
@@ -543,6 +552,16 @@ struct nexthop *nexthop_select_path(struct nexthop *nh, int hash)
 			
 			if (hash > atomic_read(&nhge->upper_bound))
 				continue;
+
+			if(nhge->nh->is_group){
+				struct nh_group * nhgj = 
+					rcu_dereference(nhge->nh->nh_grp);
+				struct nexthop *nhe;
+				if(!nhgj->frr)
+					return rc;
+				nhe = get_active_back_nexthop(nhgj);
+				return nhe;
+			}
 
 			/* nexthops always check if it is good and does
 			 * not rely on a sysctl for this behavior
@@ -581,48 +600,10 @@ int nexthop_for_each_fib6_nh(struct nexthop *nh,
 
 		nhg = rcu_dereference_rtnl(nh->nh_grp);
 		if(nhg->frr){
-			struct nexthop *p, *b, *n;
-			struct nh_info *nhi;
-			switch(nhg->num_nh){
-				case 0:
-					return -EINVAL;
-				case 1:
-					b = nhg->nh_entries[0].nh;
-					if(!b)
-						return -EINVAL;
-					nhi = rcu_dereference(b->nh_info);
-					if (ipv6_good_nh(&nhi->fib6_nh) && 
-								(b->frr_state))
-						n = b;
-					else return -EINVAL;
-				case 2:
-					p = nhg->nh_entries[0].nh;
-					b = nhg->nh_entries[1].nh;
-					if(!p){
-						if(!b)
-							return -EINVAL;
-					nhi = rcu_dereference(b->nh_info);
-					if (ipv6_good_nh(&nhi->fib6_nh) && 
-								(b->frr_state) )
-						n = b;
-					else return -EINVAL;	
-					}
-					nhi = rcu_dereference(p->nh_info);
-					if (ipv6_good_nh(&nhi->fib6_nh) && 
-								(p->frr_state))
-						n = p;
-					else{ 
-						if(!b)
-							return -EINVAL;
-						nhi = rcu_dereference(b->nh_info);
-						if (ipv6_good_nh(&nhi->fib6_nh) 
-							&& (b->frr_state))
-							n = b;
-						else return -EINVAL;
-					}
-				default:
-					return -EINVAL;
-			}
+		
+			struct nexthop *n = get_active_back_nexthop(nhg);
+			if(!n)
+				return -EINVAL;
 			nhi = rcu_dereference_rtnl(n->nh_info);
 			err = cb(&nhi->fib6_nh, arg);
 			if (err)
@@ -630,9 +611,20 @@ int nexthop_for_each_fib6_nh(struct nexthop *nh,
 		}
 		else{
 			for (i = 0; i < nhg->num_nh; i++) {
+				struct nexthop *n;
 				struct nh_grp_entry *nhge = &nhg->nh_entries[i];
 
-				nhi = rcu_dereference_rtnl(nhge->nh->nh_info);
+				if(nhge->nh->is_group){
+					struct nh_group * nhgj = 
+						rcu_dereference(nhge->nh->nh_grp);
+					if(!nhgj->frr)
+						return -EINVAL;
+					n = get_active_back_nexthop(nhgj);
+					
+				}
+				else n = nhge->nh;
+
+				nhi = rcu_dereference_rtnl(n->nh_info);
 				err = cb(&nhi->fib6_nh, arg);
 				if (err)
 					return err;
@@ -858,7 +850,6 @@ static void remove_nexthop_group(struct nexthop *nh, struct nl_info *nlinfo)
 
 		if (WARN_ON(!nhge->nh))
 			continue;
-
 		list_del(&nhge->nh_list);
 		nexthop_put(nhge->nh);
 		nhge->nh = NULL;
@@ -948,7 +939,10 @@ static void __remove_nexthop(struct net *net, struct nexthop *nh,
 	__remove_nexthop_fib(net, nh);
 
 	if (nh->is_group) {
+		struct nh_group *nhg = rcu_dereference_rtnl(nh->nh_grp); 
 		remove_nexthop_group(nh, nlinfo);
+		if(nhg->frr)
+			remove_nexthop_from_groups(net, nh, nlinfo);
 	} else {
 		struct nh_info *nhi;
 
@@ -1274,7 +1268,19 @@ static struct nexthop *nexthop_create_group(struct net *net,
 		struct nh_info *nhi;
 
 		nhe = nexthop_find_by_id(net, entry[i].id);
-		if (!nexthop_get(nhe))
+		if(nhe->is_group && nhe->is_frr){
+			struct nexthop *nhej;
+			struct nh_group *nhge = rtnl_dereference(nhe->nh_grp);
+			int j;
+			for(j = 0; j < nhge->num_nh; ++j){
+				nhej = nhge->nh_entries[i].nh;
+				if (!nexthop_get(nhej))
+					goto out_no_nh;
+				printk(KERN_INFO "adding group to nh group %d\n", nhej->id);
+			}
+		}
+
+		else if (!nexthop_get(nhe))
 			goto out_no_nh;
 
 		if (cfg->nh_grp_type == NEXTHOP_GRP_TYPE_FRR){
