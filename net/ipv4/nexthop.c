@@ -184,6 +184,9 @@ static int nla_put_nh_group(struct sk_buff *skb, struct nh_group *nhg)
 	if (nhg->mpath)
 		group_type = NEXTHOP_GRP_TYPE_MPATH;
 
+	if (nhg->active_backup)
+		group_type = NEXTHOP_GRP_TYPE_ACTIVE_BACKUP;
+
 	if (nla_put_u16(skb, NHA_GROUP_TYPE, group_type))
 		goto nla_put_failure;
 
@@ -388,6 +391,7 @@ static bool valid_group_nh(struct nexthop *nh, unsigned int npaths,
 }
 
 static int nh_check_attr_group(struct net *net, struct nlattr *tb[],
+			       u16 nh_grp_type,
 			       struct netlink_ext_ack *extack)
 {
 	unsigned int len = nla_len(tb[NHA_GROUP]);
@@ -404,6 +408,13 @@ static int nh_check_attr_group(struct net *net, struct nlattr *tb[],
 	len /= sizeof(*nhg);
 
 	nhg = nla_data(tb[NHA_GROUP]);
+
+	if ((nh_grp_type == NEXTHOP_GRP_TYPE_ACTIVE_BACKUP) &&
+	    ((len != 2) || nhg[0].weight || nhg[1].weight)) {
+		NL_SET_ERR_MSG(extack, "Active/backup group must have 2 nexthops and weight can not ");
+		return -EINVAL;
+	}
+
 	for (i = 0; i < len; ++i) {
 		if (nhg[i].resvd1 || nhg[i].resvd2) {
 			NL_SET_ERR_MSG(extack, "Reserved fields in nexthop_grp must be 0");
@@ -433,7 +444,7 @@ static int nh_check_attr_group(struct net *net, struct nlattr *tb[],
 		if (!valid_group_nh(nh, len, extack))
 			return -EINVAL;
 	}
-	for (i = NHA_GROUP + 1; i < __NHA_MAX; ++i) {
+	for (i = NHA_GROUP_TYPE + 1; i < __NHA_MAX; ++i) {
 		if (!tb[i])
 			continue;
 
@@ -501,16 +512,43 @@ static bool good_nh(struct nexthop *nh)
 	return true;
 }
 
-struct nexthop *nexthop_select_path(struct nexthop *nh, int hash)
+static struct nexthop *nh_select_path_ab(struct nh_group *nhg, int hash)
 {
 	struct nexthop *rc = NULL;
-	struct nh_group *nhg;
+	struct nexthop *p, *b;
+
+	switch(nhg->num_nh) {
+	case 2:
+		/* if primary is good, use it */
+		p = nhg->nh_entries[0].nh;
+		if (good_nh(p)) {
+			rc = p;
+			break;
+		}
+
+		/* try backup */
+		b = nhg->nh_entries[1].nh;
+		if (good_nh(b))
+			rc = b;
+		break;
+	case 1:
+		p = nhg->nh_entries[0].nh;
+		if (good_nh(p))
+			rc = p;
+		break;
+	default:
+		WARN_ON_ONCE(1);
+		break;
+	}
+
+	return rc;
+}
+
+static struct nexthop *nh_select_path_mpath(struct nh_group *nhg, int hash)
+{
+	struct nexthop *rc = NULL;
 	int i;
 
-	if (!nh->is_group)
-		return nh;
-
-	nhg = rcu_dereference(nh->nh_grp);
 	for (i = 0; i < nhg->num_nh; ++i) {
 		struct nh_grp_entry *nhge = &nhg->nh_entries[i];
 		struct nexthop *nh;
@@ -520,8 +558,16 @@ struct nexthop *nexthop_select_path(struct nexthop *nh, int hash)
 
 		nh = nhge->nh;
 
-		if (good_nh(nh))
+		/* group in a group; inner one is active/backup pair */
+		if (unlikely(nh->is_group)) {
+			struct nh_group *nhg = rcu_dereference(nh->nh_grp);
+
+			nh = nh_select_path_ab(nhg, hash);
+			if (nh)
+				return nh;
+		} else if (good_nh(nh)) {
 			return nh;
+		}
 
 		if (!rc)
 			rc = nh;
@@ -529,17 +575,56 @@ struct nexthop *nexthop_select_path(struct nexthop *nh, int hash)
 
 	return rc;
 }
+
+struct nexthop *nexthop_select_path(struct nexthop *nh, int hash)
+{
+	struct nexthop *rc = NULL;
+	struct nh_group *nhg;
+
+	if (!nh->is_group)
+		return nh;
+
+	nhg = rcu_dereference(nh->nh_grp);
+	if (nhg->active_backup)
+		rc = nh_select_path_ab(nhg, hash);
+	else
+		rc = nh_select_path_mpath(nhg, hash);
+
+	return rc;
+}
 EXPORT_SYMBOL_GPL(nexthop_select_path);
 
 static int nexthop_fib6_nh_cb(struct nexthop *nh,
-			      int (*cb)(struct fib6_nh *nh, void *arg),
-			      void *arg)
+			     int (*cb)(struct fib6_nh *nh, void *arg),
+			     void *arg)
 {
 	struct nh_info *nhi;
 
 	nhi = rcu_dereference_rtnl(nh->nh_info);
 
 	return cb(&nhi->fib6_nh, arg);
+}
+
+static int nexthop_fib6_ab_nhg_cb(struct nh_group *nhg, bool primary_only,
+				  int (*cb)(struct fib6_nh *nh, void *arg),
+				  void *arg)
+{
+	int err;
+	int i;
+
+	for (i = 0; i < nhg->num_nh; i++) {
+		struct nh_grp_entry *nhge = &nhg->nh_entries[i];
+		struct nexthop *nh = nhge->nh;
+
+		err = nexthop_fib6_nh_cb(nh, cb, arg);
+		if (err)
+			return err;
+
+		if (primary_only)
+			break;
+	}
+
+	return 0;
 }
 
 static int nexthop_fib6_nhg_cb(struct nh_group *nhg, bool primary_only,
@@ -553,7 +638,17 @@ static int nexthop_fib6_nhg_cb(struct nh_group *nhg, bool primary_only,
 		struct nh_grp_entry *nhge = &nhg->nh_entries[i];
 		struct nexthop *nh = nhge->nh;
 
-		err = nexthop_fib6_nh_cb(nh, cb, arg);
+		if (unlikely(nh->is_group)) {
+			struct nh_group *nhg2;
+
+			nhg2 = rcu_dereference(nh->nh_grp);
+			/* group in group is active/backup */
+			err = nexthop_fib6_ab_nhg_cb(nhg2, primary_only,
+						     cb, arg);
+		} else {
+			err = nexthop_fib6_nh_cb(nh, cb, arg);
+		}
+
 		if (err)
 			return err;
 	}
@@ -882,6 +977,11 @@ static int replace_nexthop_grp(struct net *net, struct nexthop *old,
 	oldg = rtnl_dereference(old->nh_grp);
 	newg = rtnl_dereference(new->nh_grp);
 
+	if (oldg->active_backup ^ newg->active_backup) {
+		NL_SET_ERR_MSG(extack, "Can not change group type with replace");
+		return -EINVAL;
+	}
+
 	/* update parents - used by nexthop code for cleanup */
 	for (i = 0; i < newg->num_nh; i++)
 		newg->nh_entries[i].nh_parent = old;
@@ -1156,6 +1256,9 @@ static struct nexthop *nexthop_create_group(struct net *net,
 		nh_group_rebalance(nhg);
 	}
 
+	if (cfg->nh_grp_type == NEXTHOP_GRP_TYPE_ACTIVE_BACKUP)
+		nhg->active_backup = true;
+
 	rcu_assign_pointer(nh->nh_grp, nhg);
 
 	return nh;
@@ -1398,7 +1501,7 @@ static int rtm_to_nh_config(struct net *net, struct sk_buff *skb,
 			NL_SET_ERR_MSG(extack, "Invalid group type");
 			goto out;
 		}
-		err = nh_check_attr_group(net, tb, extack);
+		err = nh_check_attr_group(net, tb, cfg->nh_grp_type, extack);
 
 		/* no other attributes should be set */
 		goto out;
@@ -1580,6 +1683,9 @@ static int rtm_del_nexthop(struct sk_buff *skb, struct nlmsghdr *nlh,
 	nh = nexthop_find_by_id(net, id);
 	if (!nh)
 		return -ENOENT;
+
+	if (err)
+		return err;
 
 	remove_nexthop(net, nh, &nlinfo);
 

@@ -72,6 +72,7 @@ struct nh_grp_entry {
 struct nh_group {
 	u16			num_nh;
 	bool			mpath;
+	bool			active_backup;
 	bool			has_v4;
 	struct nh_grp_entry	nh_entries[];
 };
@@ -188,7 +189,7 @@ static inline bool nexthop_is_blackhole(const struct nexthop *nh)
 		struct nh_group *nh_grp;
 
 		nh_grp = rcu_dereference_rtnl(nh->nh_grp);
-		if (nh_grp->num_nh > 1)
+		if (nh_grp->active_backup || nh_grp->num_nh > 1)
 			return false;
 
 		nh = nh_grp->nh_entries[0].nh;
@@ -225,6 +226,10 @@ struct fib_nh_common *nexthop_fib_nhc(struct nexthop *nh, int nhsel)
 			nh = nexthop_mpath_select(nh_grp, nhsel);
 			if (!nh)
 				return NULL;
+		} else if (nh_grp->active_backup) {
+			if (nhsel > 0)
+				return NULL;
+			nh = nh_grp->nh_entries[0].nh;
 		}
 	}
 
@@ -273,9 +278,8 @@ static inline struct fib6_nh *nexthop_fib6_nh(struct nexthop *nh)
 		struct nh_group *nh_grp;
 
 		nh_grp = rcu_dereference_rtnl(nh->nh_grp);
-		nh = nexthop_mpath_select(nh_grp, 0);
-		if (!nh)
-			return NULL;
+		/* works for both types of groups */
+		nh = nh_grp->nh_entries[0].nh;
 	}
 
 	nhi = rcu_dereference_rtnl(nh->nh_info);
